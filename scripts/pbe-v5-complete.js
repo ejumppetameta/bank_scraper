@@ -1,0 +1,435 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { pipeline } from 'node:stream'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+import puppeteer from 'puppeteer'
+import { Builder, By, until } from 'selenium-webdriver'
+import chrome from 'selenium-webdriver/chrome.js'
+
+// Convert pipeline to a promise-based function
+const streamPipeline = promisify(pipeline)
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+const DOWNLOAD_DIR = path.join(__dirname, 'statement') // Base directory for statements
+
+console.log(`Download directory set to: ${DOWNLOAD_DIR}`)
+
+// ---------------------------
+// ✅ LOGIN USING PUPPETEER (ENHANCED WITH IFRAME HANDLING)
+// ---------------------------
+
+const BANK_URL = 'https://www2.pbebank.com/pbemain.html'
+const BANK_USERNAME = 'your-username' // Replace with actual username
+const BANK_PASSWORD = 'your-password' // Replace with actual password
+
+// Simulate human-like typing speed
+async function typeLikeHuman(page, selector, text) {
+  for (const char of text)
+    await page.type(selector, char, { delay: Math.floor(Math.random() * 200) + 50 })
+}
+
+/**
+ * Helper function to generate a unique session code (e.g., "46mku9-op7v")
+ */
+function generateUniqueCode() {
+  return `${Math.random().toString(36).substring(2, 8)}-${Math.random().toString(36).substring(2, 8)}`
+}
+
+async function downloadStatementsForAllAccounts(page) {
+  console.log('🔍 Retrieving account options...')
+
+  // Generate a unique code for this session
+  const uniqueCode = generateUniqueCode()
+
+  // Get all account options
+  const accountOptions = await page.$$eval('select[name="selected_acc"] option', options =>
+    options
+      .filter(opt => opt.value) // Remove empty options
+      .map(opt => ({ value: opt.value, text: opt.innerText.trim() })),
+  )
+
+  console.log(`✅ Found ${accountOptions.length} accounts.`)
+
+  for (const account of accountOptions) {
+    console.log(`🔄 Selecting account: ${account.text} (${account.value})`)
+
+    // Select the account
+    await page.select('select[name="selected_acc"]', account.value)
+    await new Promise(resolve => setTimeout(resolve, 2000))
+
+    // Click the Next button
+    await page.click('button[onclick="javascript:doSubmit();"]')
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 })
+
+    console.log('✅ Loaded Statement Page')
+
+    // Download latest 3 months of statements
+    await downloadLatestStatements(page, account.value, account.text, uniqueCode)
+
+    // Go back to the statement selection page
+    console.log('🔄 Returning to Statement Selection Page...')
+    await page.click('a[href*="MethodName=formStatementDownload"]')
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 })
+
+    console.log('✅ Returned to Statement Selection Page')
+  }
+}
+
+/**
+ * Function to download the last 3 statements
+ */
+
+async function downloadLatestStatements(page, accountNumber, accountName, uniqueCode) {
+  console.log(`🔍 Retrieving available statements for ${accountNumber} (${accountName})...`)
+
+  const sanitizedAccountName = accountName.replace(/\\/g, '-')
+
+  const statementLinks = await page.$$eval('a[name="STMT_DATE"]', links =>
+    links.map(link => ({ text: link.innerText.trim(), onclick: link.getAttribute('onclick') })),
+  )
+
+  console.log(`✅ Found ${statementLinks.length} statements.`)
+
+  const latestStatements = statementLinks.slice(0, 3)
+  const accountFolderPath = path.join(DOWNLOAD_DIR, uniqueCode, `${accountNumber} (${sanitizedAccountName})`)
+  if (!fs.existsSync(accountFolderPath))
+    fs.mkdirSync(accountFolderPath, { recursive: true })
+
+  for (const stmt of latestStatements) {
+    console.log(`⬇️ Downloading statement: ${stmt.text}`)
+
+    const match = stmt.onclick.match(/openStmt\('([^']+)',\s*'([^']+)',\s*'([^']+)'\)/)
+    if (match) {
+      const [_, unid, hashUnid, repoId] = match
+
+      const [newPage] = await Promise.all([
+        new Promise(resolve => page.once('popup', resolve)),
+        page.evaluate((unid, hashUnid, repoId) => {
+          document.querySelector('input[name="UNID"]').value = unid
+          document.querySelector('input[name="HASH_UNID"]').value = hashUnid
+          document.querySelector('input[name="REPOSITORY_ID"]').value = repoId
+          document.frm2.submit()
+        }, unid, hashUnid, repoId),
+      ])
+
+      console.log('🔗 Waiting for the PDF viewer to load...')
+      await new Promise(resolve => setTimeout(resolve, 5000))
+
+      const base64Pdf = await newPage.evaluate(() => {
+        const pdfEmbed = document.querySelector('embed, object, iframe')
+
+        return pdfEmbed ? pdfEmbed.getAttribute('src') : null
+      })
+
+      if (base64Pdf && base64Pdf.startsWith('data:application/pdf;base64,')) {
+        const pdfBuffer = Buffer.from(base64Pdf.split(',')[1], 'base64')
+
+        const pdfFileName = `${stmt.text.replace(/\//g, '-')}.pdf`
+        const pdfFilePath = path.join(accountFolderPath, pdfFileName)
+
+        fs.writeFileSync(pdfFilePath, pdfBuffer)
+
+        console.log(`✅ Statement saved: ${pdfFilePath}`)
+      }
+      else {
+        console.error(`❌ Failed to extract PDF for ${stmt.text}`)
+      }
+
+      await newPage.close()
+    }
+    else {
+      console.error(`❌ Failed to extract parameters for statement: ${stmt.text}`)
+    }
+  }
+}
+
+/**
+ * Helper function to wait for the file download to complete
+ */
+
+async function loginWithPuppeteer(accessId, password) {
+  console.log('🔵 Using Puppeteer for login...')
+  try {
+    const browser = await puppeteer.launch({ headless: false })
+    const page = await browser.newPage()
+
+    await page.setViewport({ width: 1280, height: 800 })
+
+    console.log(`🔍 Navigating to ${BANK_URL}`)
+    await page.goto(BANK_URL, { waitUntil: 'domcontentloaded' })
+
+    console.log('⏳ Extracting actual login URL...')
+    await new Promise(resolve => setTimeout(resolve, 3000))
+
+    const loginUrlElement = await page.$('input#pbb_eai')
+
+    const loginUrl = loginUrlElement
+      ? await page.$eval('input#pbb_eai', el => el.value)
+      : 'https://www2.pbebank.com/myIBK/apppbb/servlet/BxxxServlet?RDOName=BxxxAuth&MethodName=login'
+
+    console.log(`🔀 Redirecting to actual login page: ${loginUrl}`)
+    await page.goto(loginUrl, { waitUntil: 'networkidle2' })
+
+    console.log('⏳ Checking for iframe...')
+    await new Promise(resolve => setTimeout(resolve, 3000))
+
+    let frame = page
+    const iframeElement = await page.$('iframe')
+    if (iframeElement) {
+      console.log('✅ Found iframe, switching context...')
+      frame = await iframeElement.contentFrame()
+    }
+
+    console.log('⏳ Waiting for username field...')
+    await frame.waitForSelector('input[name="tempusername"]', { visible: true, timeout: 20000 })
+
+    console.log('📝 Typing Username...')
+    await typeLikeHuman(frame, 'input[name="tempusername"]', accessId)
+
+    console.log('✅ Clicking Next Button...')
+    await frame.waitForSelector('#NextBtn', { visible: true, timeout: 10000 })
+    await frame.click('#NextBtn')
+
+    console.log('⏳ Waiting for "Yes" radio button...')
+    await frame.waitForSelector('input[name="passcred"][value="YES"]', { visible: true, timeout: 15000 })
+
+    console.log('✅ Clicking "Yes" radio button...')
+    await frame.click('input[name="passcred"][value="YES"]')
+
+    console.log('⏳ Waiting for password field to be enabled...')
+    await frame.waitForFunction(() => {
+      const el = document.querySelector('input[name="password"]')
+
+      return el && !el.disabled
+    }, { timeout: 30000 })
+
+    console.log('📝 Typing Password...')
+    await typeLikeHuman(frame, 'input[name="password"]', password)
+
+    console.log('✅ Clicking Login Button...')
+    await frame.waitForSelector('#SubmitBtn', { visible: true, timeout: 30000 })
+    await frame.click('#SubmitBtn')
+
+    console.log('⏳ Waiting for dashboard to load...')
+    await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 })
+
+    // await page.waitForSelector('.page-title', { visible: true, timeout: 30000 })
+
+    console.log('✅ Login successful!')
+
+    console.log('⏳ Taking a screenshot before navigating to Account Page...')
+    await page.screenshot({ path: 'debug_before_account_page.png', fullPage: true })
+
+    console.log('⏳ Navigating to Account Page...')
+
+    // ✅ Click the "Account" link by triggering JavaScript instead of normal clicking
+    await page.evaluate(() => {
+      const accountLink = document.querySelector('a[href*=\'BxxxAccountInfo_sum\']')
+      if (accountLink)
+        accountLink.click()
+    })
+
+    console.log('⏳ Waiting for Account Page to load...')
+
+    // ✅ Wait for account summary text
+    // await page.waitForFunction(() => {
+    //   return document.body.innerText.includes('Account Summary')
+    // }, { timeout: 20000 })
+
+    console.log('✅ Successfully opened Account Page!')
+
+    // ✅ Navigate to Statement Page
+    console.log('⏳ Navigating to Statement Page...')
+
+    const statementSelector = 'a[href*="MethodName=formStatementDownload"]'
+
+    await page.waitForSelector(statementSelector, { visible: true, timeout: 15000 })
+
+    console.log('✅ Clicking Statement Page link...')
+    await new Promise(resolve => setTimeout(resolve, 3000))
+    await page.click(statementSelector)
+
+    console.log('⏳ Waiting for Statement Page to load...')
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 })
+
+    console.log('✅ Successfully opened Statement Page!')
+
+    // Process accounts
+    await downloadStatementsForAllAccounts(page)
+
+    // ✅ Wait 10 seconds before logout
+    console.log('⏳ Waiting 10 seconds before logging out...')
+    await new Promise(resolve => setTimeout(resolve, 10000))
+
+    console.log('🔍 Searching for logout button...')
+
+    const logoutButton = await page.waitForSelector('a[href*="MethodName=logout"]', { visible: true, timeout: 10000 })
+
+    console.log('🚪 Logging out...')
+    await logoutButton.click()
+
+    console.log('✅ Successfully logged out.')
+    await browser.close()
+
+    return true
+  }
+  catch (error) {
+    console.error('❌ Puppeteer login failed:', error)
+
+    return false
+  }
+}
+
+// ---------------------------
+// ✅ LOGIN USING SELENIUM (IMPROVED IFRAME HANDLING)
+// ---------------------------
+async function loginWithSelenium(accessId, password) {
+  console.log('🔵 Using Selenium for login...')
+  try {
+    const options = new chrome.Options()
+
+    options.addArguments('--headless') // Change to false if you want to see the browser
+
+    const driver = await new Builder().forBrowser('chrome').setChromeOptions(options).build()
+
+    console.log(`🔍 Navigating to ${BANK_URL}`)
+    await driver.get(BANK_URL)
+
+    console.log('⏳ Extracting actual login URL...')
+    await driver.sleep(3000) // Short sleep to allow DOM to load
+
+    let loginUrl
+    try {
+      const loginUrlElement = await driver.wait(until.elementLocated(By.id('pbb_eai')), 10000)
+
+      loginUrl = await loginUrlElement.getAttribute('value')
+    }
+    catch {
+      console.log('⚠️ Login URL not found, using default.')
+      loginUrl = 'https://www2.pbebank.com/myIBK/apppbb/servlet/BxxxServlet?RDOName=BxxxAuth&MethodName=login'
+    }
+
+    console.log(`🔀 Redirecting to actual login page: ${loginUrl}`)
+    await driver.get(loginUrl)
+
+    console.log('⏳ Checking for iframe...')
+    await driver.sleep(3000)
+
+    // Detect if iframe is present
+    const iframes = await driver.findElements(By.tagName('iframe'))
+    if (iframes.length > 0) {
+      console.log('✅ Found iframe, switching to it...')
+      await driver.switchTo().frame(iframes[0]) // Switch to the first iframe
+    }
+
+    console.log('⏳ Waiting for username field...')
+
+    const usernameField = await driver.wait(until.elementLocated(By.name('tempusername')), 20000)
+
+    console.log('📝 Typing Username...')
+    for (const char of accessId) {
+      await usernameField.sendKeys(char)
+      await driver.sleep(Math.floor(Math.random() * 300) + 100) // Simulate human typing
+    }
+
+    console.log('✅ Clicking Next Button...')
+
+    const nextButton = await driver.wait(until.elementLocated(By.id('NextBtn')), 10000)
+
+    await nextButton.click()
+
+    console.log('⏳ Waiting for "Yes" radio button...')
+    await driver.wait(until.elementLocated(By.css('input[name="passcred"][value="YES"]')), 15000)
+
+    console.log('✅ Clicking "Yes" radio button...')
+
+    const yesRadioButton = await driver.findElement(By.css('input[name="passcred"][value="YES"]'))
+
+    await yesRadioButton.click()
+
+    console.log('⏳ Waiting for password field to be enabled...')
+    await driver.wait(async () => {
+      const el = await driver.findElement(By.name('password'))
+
+      return el.isEnabled()
+    }, 10000)
+
+    console.log('📝 Typing Password...')
+
+    const passwordField = await driver.findElement(By.name('password'))
+    for (const char of password) {
+      await passwordField.sendKeys(char)
+      await driver.sleep(Math.floor(Math.random() * 300) + 100) // Simulate human typing
+    }
+
+    console.log('✅ Clicking Login Button...')
+
+    const loginButton = await driver.wait(until.elementLocated(By.id('SubmitBtn')), 10000)
+
+    await loginButton.click()
+
+    console.log('⏳ Checking if login is successful...')
+    try {
+      await driver.wait(until.elementLocated(By.id('new-ebank-container')), 8000)
+      console.log('✅ Login successful with Selenium!')
+
+      // ✅ Navigate to Account Page Before Logout
+      console.log('⏳ Navigating to Account Page...')
+      await driver.wait(until.elementLocated(By.xpath('//a[contains(@href, "BxxxAccountInfo_sum")]')), 15000)
+
+      const accountPageLink = await driver.findElement(By.xpath('//a[contains(@href, "BxxxAccountInfo_sum")]'))
+
+      await accountPageLink.click()
+
+      console.log('⏳ Waiting for Account Page to load...')
+      await driver.sleep(5000) // Allow time for page transition
+
+      console.log('✅ Account Page loaded successfully!')
+
+      // ✅ Wait 10 seconds before logging out
+      console.log('⏳ Waiting 10 seconds before logging out...')
+      await driver.sleep(10000)
+
+      console.log('🔍 Searching for logout button...')
+
+      const logoutButton = await driver.wait(
+        until.elementLocated(By.xpath('//a[contains(@href, "MethodName=logout")]')),
+        10000,
+      )
+
+      console.log('🚪 Logging out...')
+      await logoutButton.click()
+
+      console.log('✅ Successfully logged out.')
+    }
+    catch (error) {
+      console.log('⚠️ Login might have failed or encountered MFA.')
+    }
+
+    await driver.quit()
+  }
+  catch (error) {
+    console.error('❌ Selenium login failed:', error)
+  }
+}
+
+// ---------------------------
+// ✅ START SCRAPING PROCESS
+// ---------------------------
+async function startScraping() {
+  console.log('🔎 Starting login test...')
+
+  const puppeteerSuccess = await loginWithPuppeteer(BANK_USERNAME, BANK_PASSWORD)
+  if (!puppeteerSuccess) {
+    console.log('Puppeteer failed, switching to Selenium...')
+    await loginWithSelenium(BANK_USERNAME, BANK_PASSWORD)
+  }
+}
+
+// ---------------------------
+// ✅ RUN THE SCRIPT
+// ---------------------------
+startScraping()

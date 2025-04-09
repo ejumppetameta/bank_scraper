@@ -1,0 +1,79 @@
+# Use PHP 8.2 with FPM
+FROM php:8.2-fpm
+
+# Set working directory
+WORKDIR /var/www
+
+# Install system dependencies (PHP extensions + Node.js dependencies)
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    unzip \
+    libpq-dev \
+    libpng-dev \
+    libjpeg-dev \
+    libfreetype6-dev \
+    libonig-dev \
+    libzip-dev \
+    libx11-xcb1 \
+    libxcb-dri3-0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libxss1 \
+    libasound2 \
+    libpangocairo-1.0-0 \
+    libgtk-3-0 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libgbm1 \
+    && docker-php-ext-install pdo pdo_mysql mysqli zip mbstring exif pcntl bcmath gd \
+    && curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+# Install Node.js (Using NodeSource setup script)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs
+
+# Set working directory
+WORKDIR /var/www
+
+# Copy application files
+COPY . .
+
+# Install Composer dependencies
+RUN composer install --no-dev --optimize-autoloader
+
+# Install npm dependencies
+RUN npm install --legacy-peer-deps
+
+# Install Playwright browsers and dependencies
+RUN npx playwright install chromium --with-deps
+
+# Ensure Puppeteer Chromium installation (optional, but recommended if using Puppeteer)
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD false
+# Install npm dependencies including puppeteer
+RUN npm install --legacy-peer-deps
+
+# Set permissions for Laravel
+RUN chmod -R 777 storage bootstrap/cache
+
+# Expose port 8080 for Laravel
+EXPOSE 8080
+
+# Start Laravel server
+CMD ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8080"]
+
+
+### Explanation & Notes:
+
+# This Dockerfile now installs:
+# PHP extensions essential for Laravel.
+# Composer for PHP dependency management.
+# Node.js and npm packages with Playwright browsers pre-installed.
+# Puppeteer setup for web scraping (with Chromium).
+
+# It's optimized for automated builds (including your GitHub Action workflows), reducing manual post-container configuration.
+
+# Ensures containers are ready to immediately run Laravel and your Node.js-based scraping scripts without extra manual installation commands at runtime.
+
+# Now, each new container built from this image will have all tools ready and won't require manual interventions after deployment.
